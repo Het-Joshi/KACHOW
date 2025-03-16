@@ -1,0 +1,19 @@
+[
+  {
+    "tool": "TunnelPyjamas",
+    "measurement_number": 1,
+    "timestamp": 79796146.541449,
+    "url": "/webtest",
+    "status_code": 0,
+    "download_speed": 0.0,
+    "upload_speed": 0.0,
+    "dns_lookup": 0.0,
+    "tcp_connection": 0.0,
+    "tls_handshake": 0.0,
+    "time_to_first_byte": 0.0,
+    "total_time": 0.0,
+    "fcp": 0.0,
+    "lcp": 0.0,
+    "error": "Playwright error: Page.goto: Protocol error (Page.navigate): Cannot navigate to invalid URL\nCall log:\n  - navigating to \"/webtest\", waiting until \"load\"\n"
+  }
+]
