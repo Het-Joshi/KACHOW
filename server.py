@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File, Response
+from fastapi import FastAPI, File, HTTPException
 from fastapi.responses import JSONResponse, FileResponse, HTMLResponse
 import uvicorn
 import os
@@ -12,24 +12,24 @@ import psutil
 import logging
 import signal
 import sys
-from typing import List
+import shutil  # For checking binary existence
 import textwrap
 
-# Import our tunnel tools from our new tools.py module
-from tunnel_tools import tunnel_tools  # This should provide a list of our TunnelTool implementations
+# Import tunnel tools from tunnel_tools.py
+from tunnel_tools import tunnel_tools
 
-# ==================== Global Constants and Variables ==================== #
-ENABLE_PCAP = False         # Set to True to enable PCAP capturing (stubbed for academic purposes)
-ENABLE_LOGGING = True       # Enable detailed logging
+# ---------------- Global Constants and Variables ---------------- #
+ENABLE_PCAP = False         # Set to True to enable PCAP capturing (stubbed)
+ENABLE_LOGGING = True         # Enable detailed logging
 PORT = 3000
 INPUT_FILES_DIR = os.path.join(os.path.dirname(__file__), "input_files")
 os.makedirs(INPUT_FILES_DIR, exist_ok=True)
 active_tunnel = None
 
-# Global list to track all child processes (spawned by the tunnel tools)
+# Global list to track child processes (if needed)
 child_processes = []
 
-# ==================== Logging Setup ==================== #
+# ---------------- Logging Setup ---------------- #
 try:
     import colorlog
     handler = colorlog.StreamHandler()
@@ -52,7 +52,29 @@ except ImportError:
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
     logger = logging.getLogger("epic_server")
 
-# ==================== Signal Handling ==================== #
+# ---------------- FastAPI Lifespan ---------------- #
+from contextlib import asynccontextmanager
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("🚀 Server startup")
+    yield
+    # Shutdown: try stopping any active tunnel
+    if active_tunnel:
+        logger.info("🛑 Shutting down active tunnel")
+        try:
+            await asyncio.get_event_loop().run_in_executor(None, active_tunnel.stop)
+        except Exception as e:
+            logger.error(f"Error stopping active tunnel during shutdown: {str(e)}")
+    logger.info("🛑 Server shutdown")
+
+app = FastAPI(
+    title="Epic Tunnel Tools Server",
+    description="An academically inclined, optimized server that integrates advanced tunnel tools.",
+    version="1.0",
+    lifespan=lifespan
+)
+
+# ---------------- Signal Handling ---------------- #
 def kill_child_processes():
     for proc in child_processes:
         try:
@@ -67,7 +89,7 @@ def signal_handler(sig, frame):
 
 signal.signal(signal.SIGINT, signal_handler)
 
-# ==================== Helper Functions ==================== #
+# ---------------- Helper Functions ---------------- #
 def calculate_file_hash(file_path: str) -> str:
     """Compute SHA-256 hash of a file for integrity verification."""
     sha256 = hashlib.sha256()
@@ -77,7 +99,7 @@ def calculate_file_hash(file_path: str) -> str:
     return sha256.hexdigest()
 
 def get_file_metadata(file_path: str) -> dict:
-    """Return metadata for the file including name, size, hash, MIME type, and modification timestamp."""
+    """Return metadata for a file."""
     stats = os.stat(file_path)
     file_hash = calculate_file_hash(file_path)
     content_type, _ = mimetypes.guess_type(file_path)
@@ -91,23 +113,7 @@ def get_file_metadata(file_path: str) -> dict:
         "timestamp": datetime.datetime.fromtimestamp(stats.st_mtime).isoformat()
     }
 
-async def save_measurement_results(results: dict):
-    """Save performance or measurement data to a JSON file for further academic analysis."""
-    now = datetime.datetime.now()
-    filename = f"results_{now.strftime('%Y%m%d_%H%M%S')}.json"
-    file_path = os.path.join(INPUT_FILES_DIR, filename)
-    async with aiofiles.open(file_path, "w") as f:
-        await f.write(json.dumps(results, indent=2))
-    logger.info(f"Measurement results saved to {filename}")
-
-# ==================== FastAPI Application Setup ==================== #
-app = FastAPI(
-    title="Epic Tunnel Tools Server",
-    description="An academically inclined, optimized server that integrates advanced tunnel tools.",
-    version="1.0"
-)
-
-# ==================== Endpoint Implementations ==================== #
+# ---------------- API Endpoints ---------------- #
 @app.post("/start-tunnel")
 async def start_tunnel(payload: dict):
     """
@@ -118,39 +124,44 @@ async def start_tunnel(payload: dict):
     tool_name = payload.get("toolName")
     if not tool_name:
         raise HTTPException(status_code=400, detail="toolName is required.")
-    tool = next((t for t in tunnel_tools if t.name == tool_name), None)
+    # Optionally check if tool binary exists (if applicable)
+    # if not shutil.which(tool_name):
+    #     raise HTTPException(status_code=500, detail=f"Binary for {tool_name} not found.")
+    tool = next((t for t in tunnel_tools if t.name.lower() == tool_name.lower()), None)
     if not tool:
         raise HTTPException(status_code=400, detail=f"Invalid tool name: {tool_name}")
     try:
         if active_tunnel:
             logger.info("An active tunnel exists. Stopping it before starting a new one.")
             await asyncio.get_event_loop().run_in_executor(None, active_tunnel.stop)
-        # Run the blocking tunnel start in a thread pool
         loop = asyncio.get_event_loop()
         url = await loop.run_in_executor(None, tool.start, {"port": PORT})
         active_tunnel = tool
-        logger.info(f"Tunnel started successfully with URL: {url}")
+        logger.info(f"✅ Tunnel started successfully with URL: {url}")
         return JSONResponse({"url": url})
     except Exception as e:
-        logger.error(f"Failed to start tunnel: {str(e)}")
+        logger.error(f"❌ Failed to start tunnel: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to start tunnel: {str(e)}")
 
 @app.post("/stop-tunnel")
 async def stop_tunnel():
     """
     Stop the currently active tunnel.
+    Returns 200 even if no tunnel is active.
     """
     global active_tunnel
-    if not active_tunnel:
-        raise HTTPException(status_code=400, detail="No active tunnel to stop.")
-    try:
-        await asyncio.get_event_loop().run_in_executor(None, active_tunnel.stop)
-        active_tunnel = None
-        logger.info("Tunnel stopped successfully.")
-        return JSONResponse({"message": "Tunnel stopped"})
-    except Exception as e:
-        logger.error(f"Failed to stop tunnel: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to stop tunnel: {str(e)}")
+    if active_tunnel:
+        try:
+            await asyncio.get_event_loop().run_in_executor(None, active_tunnel.stop)
+            active_tunnel = None
+            logger.info("✅ Tunnel stopped successfully.")
+            return JSONResponse({"message": "Tunnel stopped"})
+        except Exception as e:
+            logger.error(f"❌ Failed to stop tunnel: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Failed to stop tunnel: {str(e)}")
+    else:
+        logger.info("⚠️ No active tunnel to stop.")
+        return JSONResponse({"message": "No active tunnel"})
 
 @app.get("/files")
 async def list_files():
@@ -162,13 +173,13 @@ async def list_files():
         files_metadata = [get_file_metadata(os.path.join(INPUT_FILES_DIR, f)) for f in files]
         return JSONResponse(files_metadata)
     except Exception as e:
-        logger.error(f"Failed to list files: {str(e)}")
+        logger.error(f"❌ Failed to list files: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to list files: {str(e)}")
 
 @app.get("/download/{filename}")
 async def download_file(filename: str):
     """
-    Download the specified file with integrity metadata in the response headers.
+    Download a specified file with integrity metadata in headers.
     """
     file_path = os.path.join(INPUT_FILES_DIR, filename)
     if not os.path.exists(file_path):
@@ -184,16 +195,12 @@ async def download_file(filename: str):
 
 @app.get("/health")
 async def health_check():
-    """
-    Health check endpoint.
-    """
+    """Health check endpoint."""
     return JSONResponse({"status": "ok", "timestamp": datetime.datetime.now().isoformat()})
 
 @app.get("/diagnostics")
 async def diagnostics():
-    """
-    Return system diagnostics for academic monitoring and optimization.
-    """
+    """Return system diagnostics for academic monitoring."""
     try:
         diagnostics_data = {
             "platform": platform.system(),
@@ -204,14 +211,12 @@ async def diagnostics():
         }
         return JSONResponse(diagnostics_data)
     except Exception as e:
-        logger.error(f"Failed to get diagnostics: {str(e)}")
+        logger.error(f"❌ Failed to get diagnostics: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to get diagnostics: {str(e)}")
 
 @app.post("/upload-test")
 async def upload_test(file: bytes = File(...)):
-    """
-    Test file upload by accepting binary data and reporting its size.
-    """
+    """Test file upload and report its size."""
     if not file:
         raise HTTPException(status_code=400, detail="No file data received")
     logger.info(f"Received file data of length: {len(file)}")
@@ -219,9 +224,7 @@ async def upload_test(file: bytes = File(...)):
 
 @app.get("/webtest")
 async def webtest():
-    """
-    Serve a heavy, high-load HTML page designed to simulate real-world stress conditions.
-    """
+    """Serve a heavy HTML page for stress testing."""
     html_content = """
     <!DOCTYPE html>
     <html lang="en">
@@ -261,11 +264,11 @@ async def webtest():
     """
     return HTMLResponse(content=html_content)
 
-# ==================== PCAP Capturing (Stubbed) ==================== #
+# ---------------- PCAP Capturing (Stubbed) ---------------- #
 @app.on_event("startup")
 async def startup_event():
     if ENABLE_PCAP:
-        logger.info("Starting PCAP capture (simulated for academic purposes).")
+        logger.info("Starting PCAP capture (simulated).")
         asyncio.create_task(dummy_pcap_capture())
 
 async def dummy_pcap_capture():
@@ -273,6 +276,6 @@ async def dummy_pcap_capture():
         logger.info("PCAP capture running (simulation).")
         await asyncio.sleep(24 * 60 * 60)
 
-# ==================== Main Entry Point ==================== #
 if __name__ == '__main__':
     uvicorn.run("server:app", host="0.0.0.0", port=PORT, reload=False)
+

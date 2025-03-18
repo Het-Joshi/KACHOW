@@ -51,28 +51,6 @@ def signal_handler(sig, frame):
 signal.signal(signal.SIGINT, signal_handler)
 
 # ----------------- Helper Functions ----------------- #
-def wait_for_pattern(process, pattern, timeout):
-    """Wait for a regex pattern in process stdout or stderr within a timeout.
-    Returns the regex match object if found; otherwise raises a TimeoutError."""
-    regex = re.compile(pattern)
-    start = time.monotonic()
-    stdout = process.stdout
-    stderr = process.stderr
-    while True:
-        for stream in (stdout, stderr):
-            if stream is None:
-                continue
-            rlist, _, _ = select.select([stream], [], [], 0.1)
-            if rlist:
-                line = stream.readline()
-                if line:
-                    logger.debug(f"Output: {line.strip()}")
-                    match = regex.search(line)
-                    if match:
-                        return match
-        if time.monotonic() - start > timeout:
-            raise TimeoutError(f"Timeout waiting for pattern: {pattern}")
-
 def ensure_tor_running():
     """Ensure Tor is running. If not, attempt to start it."""
     try:
@@ -85,6 +63,61 @@ def ensure_tor_running():
             logger.info("Tor service started successfully.")
         except subprocess.CalledProcessError as e:
             raise Exception("Failed to start Tor service") from e
+        
+def wait_for_pattern(process, patterns, timeout):
+    """Wait for regex patterns in process output. Returns first match or raises TimeoutError."""
+    compiled_patterns = [re.compile(p) for p in (patterns if isinstance(patterns, list) else [patterns])]
+    start = time.monotonic()
+    buffers = {process.stdout: '', process.stderr: ''}  # Handle stdout/stderr buffers
+
+    while True:
+        for stream in (process.stdout, process.stderr):
+            if stream is None:
+                continue
+            
+            # Read all available data without blocking
+            while True:
+                rlist, _, _ = select.select([stream], [], [], 0)
+                if not rlist:
+                    break
+                data = os.read(stream.fileno(), 4096).decode(errors='ignore')
+                if not data:
+                    break
+                buffers[stream] += data
+                logger.debug(f"Raw output chunk: {data.strip()}")
+
+        # Check all buffers for patterns
+        for stream, buffer in buffers.items():
+            for pattern in compiled_patterns:
+                match = pattern.search(buffer)
+                if match:
+                    logger.debug(f"Matched pattern '{pattern.pattern}' in buffer")
+                    return match
+                
+            # Check for line-by-line matches (legacy fallback)
+            lines = buffer.split('\n')
+            for line in lines[:-1]:  # Process complete lines
+                logger.debug(f"Output line: {line.strip()}")
+                for pattern in compiled_patterns:
+                    match = pattern.search(line)
+                    if match:
+                        return match
+
+        if time.monotonic() - start > timeout:
+            raise TimeoutError(f"Timeout waiting for patterns: {patterns}")
+
+        time.sleep(0.1)
+        if match:
+            if not match.groups():
+                return match.group(0)
+            else:
+                return match
+
+# Common URL patterns
+GENERAL_URL_PATTERNS = [
+    r'https?://[^\s>"\'\)]+',  # Most common URL pattern
+    r'\b(?:https?://)?(?:[\w-]+\.)+\w+\b'  # For URLs without scheme
+]
 
 # ----------------- Base Tunnel Class ----------------- #
 class BaseTunnel(ABC):
@@ -132,7 +165,86 @@ class BaseTunnel(ABC):
             self.process.kill()
             self.process = None
 
-# ----------------- Tunnel Tool Implementations ----------------- #
+
+
+# ----------------- Tunnel Implementations ----------------- #
+class CloudflareTunnel(BaseTunnel):
+    name = "Cloudflared"
+
+    def launch_tunnel(self, options) -> str:
+        port = options.get("port", 8000)
+        self.process = subprocess.Popen(
+            ["cloudflared", "tunnel", "--url", f"http://localhost:{port}"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1
+        )
+        try:
+            # Specific pattern for Cloudflare tunnel URLs
+            match = wait_for_pattern(
+                self.process, 
+                r"https:\/\/([a-z0-9-]+\.)+trycloudflare\.com",  # More strict pattern
+                40
+            )
+            tunnel_url = match.group(0).strip()
+            
+            # Additional validation
+            if "trycloudflare.com" not in tunnel_url:
+                raise ValueError("Invalid tunnel URL format")
+                
+            logger.info(f"Cloudflare Tunnel URL: {tunnel_url}")
+            return tunnel_url
+        except TimeoutError as e:
+            raise Exception("Timeout: Failed to start Cloudflare Tunnel") from e
+
+class ServeoTunnel(BaseTunnel):
+    name = "Serveo"
+
+    def launch_tunnel(self, options) -> str:
+        port = options.get("port", 3000)
+        # Launch ssh with stderr redirected to stdout for unified output
+        self.process = subprocess.Popen(
+            ["ssh", "-R", f"80:localhost:{port}", "serveo.net"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,  # Redirect stderr to stdout
+            text=True,
+            bufsize=1
+        )
+        try:
+            # Define a specific pattern for Serveo's output
+            serveo_pattern = re.compile(r"https://[a-zA-Z0-9-]+\.serveo\.net")
+            # Wait for the pattern in the combined output
+            match = wait_for_pattern(self.process, [serveo_pattern], 20)
+            serveo_url = match.group(0)  # Extract the full matched URL
+            logger.info(f"Serveo URL: {serveo_url}")
+            return serveo_url
+        except TimeoutError as e:
+            # Log the last few lines of output for debugging
+            output = "".join(line for line in self.process.stdout if line)
+            logger.error(f"Timeout: Failed to start Serveo Tunnel. Output: {output}")
+            raise Exception("Timeout: Failed to start Serveo Tunnel") from e
+
+    def stop(self):
+        if self.process:
+            self.process.terminate()
+            self.process.wait()
+            self.process = None
+            logger.info("Serveo stopped successfully")
+
+class BoreTunnel(BaseTunnel):
+    name = "Bore"
+
+    def launch_tunnel(self, options) -> str:
+        port = options.get("port", 3000)
+        self.process = subprocess.Popen(
+            ["bore", "local", str(port), "--to", "bore.pub"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1
+        )
+        try:
+            match = wait_for_pattern(self.process, [r"bore\.pub:\d+", r"http://bore\.pub/\w+"], 15)
+            bore_id = match.group(0).split('/')[-1] if '/' in match.group(0) else match.group(0)
+            return f"http://{bore_id}"
+        except TimeoutError as e:
+            raise Exception("Timeout: Failed to start Bore Tunnel") from e
+
 class LocalTunnel(BaseTunnel):
     name = "LocalTunnel"
 
@@ -143,38 +255,19 @@ class LocalTunnel(BaseTunnel):
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1
         )
         try:
-            match = wait_for_pattern(self.process, r"your url is: (https://[^\s]+)", 10)
-            local_tunnel_url = match.group(1)
+            match = wait_for_pattern(
+                self.process,
+                patterns=[
+                    r"your url is: (https://[^\s]+)",
+                    *GENERAL_URL_PATTERNS
+                ],
+                timeout=20
+            )
+            local_tunnel_url = match.group(1) if match.lastindex else match.group(0)
             logger.info(f"LocalTunnel URL: {local_tunnel_url}")
-            password = self.get_tunnel_password()
-            logger.info(f"Tunnel Password: {password}")
             return local_tunnel_url
         except TimeoutError as e:
             raise Exception("Timeout: Failed to start LocalTunnel") from e
-
-    def get_tunnel_password(self) -> str:
-        try:
-            response = requests.get("https://loca.lt/mytunnelpassword")
-            return response.text.strip()
-        except Exception as e:
-            raise Exception("Could not retrieve tunnel password") from e
-
-class CloudflareTunnel(BaseTunnel):
-    name = "Cloudflared"
-
-    def launch_tunnel(self, options) -> str:
-        port = options.get("port", 8000)
-        self.process = subprocess.Popen(
-            ["cloudflared", "tunnel", "--url", f"http://localhost:{port}"],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1, shell=True
-        )
-        try:
-            match = wait_for_pattern(self.process, r"https?://[a-z0-9-]+\.trycloudflare\.com", 15)
-            tunnel_url = match.group(0)
-            logger.info(f"Cloudflare Tunnel URL: {tunnel_url}")
-            return tunnel_url
-        except TimeoutError as e:
-            raise Exception("Timeout: Failed to start Cloudflare Tunnel") from e
 
 class NgrokTunnel(BaseTunnel):
     name = "Ngrok"
@@ -201,79 +294,43 @@ class NgrokTunnel(BaseTunnel):
         except Exception as e:
             raise Exception("Error fetching ngrok URL") from e
 
-class ServeoTunnel(BaseTunnel):
-    name = "Serveo"
-
-    def launch_tunnel(self, options) -> str:
-        port = options.get("port", 3000)
-        self.process = subprocess.Popen(
-            ["ssh", "-R", f"80:localhost:{port}", "serveo.net"],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1
-        )
-        try:
-            match = wait_for_pattern(self.process, r"Forwarding HTTP traffic from (https://[^\s]+)", 10)
-            serveo_url = match.group(1)
-            logger.info(f"Serveo URL: {serveo_url}")
-            return serveo_url
-        except TimeoutError as e:
-            raise Exception("Timeout: Failed to start Serveo Tunnel") from e
 
 class TelebitTunnel(BaseTunnel):
     name = "Telebit"
 
-    def launch_tunnel(self, options) -> str:
+    def launch_tunnel(self, options: dict) -> str:
         port = options.get("port", 3000)
         self.process = subprocess.Popen(
-            ["pnpm", "dlx", "telebit", "http", str(port)],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1, shell=True
+            ["stdbuf", "-oL", "pnpm", "dlx", "telebit", "http", str(port)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
         )
-        try:
-            match = wait_for_pattern(self.process, r"Forwarding (https://[^\s]+) =>", 10)
-            telebit_url = match.group(1)
-            logger.info(f"Telebit URL: {telebit_url}")
-            return telebit_url
-        except TimeoutError as e:
-            raise Exception("Timeout: Failed to start Telebit Tunnel") from e
 
-class BoreTunnel(BaseTunnel):
-    name = "Bore"
-
-    def launch_tunnel(self, options) -> str:
-        port = options.get("port", 3000)
-        self.process = subprocess.Popen(
-            ["bore", "local", str(port), "--to", "bore.pub"],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1, shell=True
-        )
-        start = time.monotonic()
-        try:
-            while True:
-                line = self.process.stdout.readline()
-                if line:
-                    words = line.split()
-                    for word in words:
-                        if word.startswith("bore.pub"):
-                            bore_url = f"http://{word}"
-                            logger.info(f"Bore URL: {bore_url}")
-                            return bore_url
-                if time.monotonic() - start > 5:
-                    raise TimeoutError("Timeout waiting for Bore Tunnel URL")
-        except Exception as e:
-            raise Exception("Failed to start Bore Tunnel") from e
-
+        telebit_pattern = r"Forwarding (https://[^\s]+) =>"
+        match = wait_for_pattern(self.process, telebit_pattern, 30)
+        return match.group(1)
+    
 class LocalxposeTunnel(BaseTunnel):
     name = "Localxpose"
 
     def launch_tunnel(self, options) -> str:
         port = options.get("port", 3000)
         self.process = subprocess.Popen(
-            ["pnpm", "dlx", "loclx", "tunnel", "http", "--to", f"localhost:{port}"],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1, shell=True
+            ["loclx", "tunnel", "http", "--to", f"localhost:{port}"],  # Removed pnpm dlx
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1
         )
         try:
-            match = wait_for_pattern(self.process, r"([a-z0-9]+\.loclx\.io)", 10)
-            loclx_url = f"http://{match.group(1)}"
-            logger.info(f"Localxpose URL: {loclx_url}")
-            return loclx_url
+            match = wait_for_pattern(
+                self.process,
+                patterns=[
+                    r"https://([a-z0-9]+\.loclx\.io)",
+                    *GENERAL_URL_PATTERNS
+                ],
+                timeout=30
+            )
+            return f"https://{match.group(1)}"
         except TimeoutError as e:
             raise Exception("Timeout: Failed to start Localxpose Tunnel") from e
 
@@ -287,7 +344,7 @@ class ExposeTunnel(BaseTunnel):
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1, shell=True
         )
         try:
-            match = wait_for_pattern(self.process, r"Public HTTPS:\s+(https://[^\s]+)", 10)
+            match = wait_for_pattern(self.process, GENERAL_URL_PATTERNS, 20)
             expose_url = match.group(1)
             logger.info(f"Expose URL: {expose_url}")
             return expose_url
@@ -304,7 +361,7 @@ class LoopholeTunnel(BaseTunnel):
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1
         )
         try:
-            match = wait_for_pattern(self.process, r"(https://[^\s]+) ->", 10)
+            match = wait_for_pattern(self.process, GENERAL_URL_PATTERNS, 20)
             loophole_url = match.group(1)
             logger.info(f"Loophole URL: {loophole_url}")
             return loophole_url
@@ -321,7 +378,7 @@ class PinggyTunnel(BaseTunnel):
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1, shell=True
         )
         try:
-            match = wait_for_pattern(self.process, r"(https://[^\s]+\.free\.pinggy\.link)", 10)
+            match = wait_for_pattern(self.process, GENERAL_URL_PATTERNS, 20)
             pinggy_url = match.group(1)
             logger.info(f"Pinggy URL: {pinggy_url}")
             return pinggy_url
@@ -338,7 +395,7 @@ class TailscaleTunnel(BaseTunnel):
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1, shell=True
         )
         try:
-            match = wait_for_pattern(self.process, r"(https://[^\s]+\.ts\.net/)", 10)
+            match = wait_for_pattern(self.process, GENERAL_URL_PATTERNS, 20)
             tailscale_url = match.group(1)
             logger.info(f"Tailscale URL: {tailscale_url}")
             return tailscale_url
@@ -348,33 +405,82 @@ class TailscaleTunnel(BaseTunnel):
 class TunnelPyjamas(BaseTunnel):
     name = "TunnelPyjamas"
 
-    def launch_tunnel(self, options) -> str:
+    def launch_tunnel(self, options):
+        """Launch the TunnelPyjamas tunnel and return the URL."""
         port = options.get("port", 3000)
+
+        # Step 1: Download tunnel configuration
         try:
-            subprocess.run(["curl", f"https://tunnel.pyjam.as/{port}", "-o", "tunnel.conf"], check=True)
+            subprocess.run(
+                ["curl", f"https://tunnel.pyjam.as/{port}", "-o", "tunnel.conf"],
+                check=True,
+                text=True,
+                capture_output=True
+            )
             os.chmod("tunnel.conf", 0o600)
         except subprocess.CalledProcessError as e:
-            raise Exception("Failed to download tunnel configuration") from e
+            raise Exception(f"Failed to download tunnel configuration: {e.stderr}") from e
+
+        # Step 2: Launch the tunnel
         self.process = subprocess.Popen(
             ["sudo", "wg-quick", "up", "./tunnel.conf"],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1, shell=True
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            shell=False
         )
+
+        # Step 3: Wait for the URL in the output
+        url_pattern = r"on (https://[^\s]+) ✨"
         try:
-            match = wait_for_pattern(self.process, r"on (https://[^\s]+) ✨", 20)
+            match = self.wait_for_pattern(self.process, url_pattern, 30)
             pyjamas_url = match.group(1).rstrip("/")
             logger.info(f"TunnelPyjamas URL: {pyjamas_url}")
             return pyjamas_url
         except TimeoutError as e:
+            output = ""
+            while True:
+                line = self.process.stdout.readline()
+                if not line:
+                    break
+                output += line
+            logger.error(f"Timeout: Failed to start tunnel. Output: {output}")
             raise Exception("Timeout: Failed to start TunnelPyjamas Tunnel") from e
 
+    def wait_for_pattern(self, process, pattern, timeout):
+        """Wait for a regex pattern in the process output with a timeout."""
+        start_time = time.monotonic()
+        compiled_pattern = re.compile(pattern)
+        while True:
+            line = process.stdout.readline()
+            if line:
+                logger.debug(f"Output: {line.strip()}")
+                match = compiled_pattern.search(line)
+                if match:
+                    return match
+            if time.monotonic() - start_time > timeout:
+                raise TimeoutError(f"Timeout waiting for pattern: {pattern}")
+            time.sleep(0.1)
+
     def stop(self):
-        logger.info(f"Bringing down {self.name} tunnel.")
-        try:
-            subprocess.run(["sudo", "wg-quick", "down", "./tunnel.conf"], check=True, text=True)
-            os.remove("tunnel.conf")
-            logger.info(f"Stopped {self.name} tunnel.")
-        except Exception as e:
-            raise Exception("Failed to bring down TunnelPyjamas Tunnel") from e
+        """Stop the tunnel and clean up."""
+        if self.process:
+            logger.info("Bringing down TunnelPyjamas tunnel.")
+            try:
+                subprocess.run(
+                    ["sudo", "wg-quick", "down", "./tunnel.conf"],
+                    check=True,
+                    text=True,
+                    capture_output=True
+                )
+                os.unlink("tunnel.conf")
+                logger.info("Stopped TunnelPyjamas tunnel.")
+            except subprocess.CalledProcessError as e:
+                logger.error(f"Failed to bring down tunnel: {e.stderr}")
+                raise Exception(f"Failed to bring down tunnel: {e.stderr}") from e
+            finally:
+                self.process = None
 
 class ZrokTunnel(BaseTunnel):
     name = "Zrok"
@@ -386,7 +492,7 @@ class ZrokTunnel(BaseTunnel):
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1, shell=True
         )
         try:
-            match = wait_for_pattern(self.process, r"(https://[^\s]+)", 10)
+            match = wait_for_pattern(self.process, GENERAL_URL_PATTERNS, 20)
             url = match.group(0).split("│")[0].strip()
             logger.info(f"Zrok URL: {url}")
             return url
@@ -403,7 +509,7 @@ class TunwgTunnel(BaseTunnel):
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1, shell=True
         )
         try:
-            match = wait_for_pattern(self.process, r"(https://[^\s]+\.l\.tunwg\.com)", 10)
+            match = wait_for_pattern(self.process, GENERAL_URL_PATTERNS, 20)
             tunwg_url = match.group(1)
             logger.info(f"Tunwg URL: {tunwg_url}")
             return tunwg_url
@@ -420,7 +526,7 @@ class PacketriotTunnel(BaseTunnel):
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1
         )
         try:
-            match = wait_for_pattern(self.process, r"(\w+-\w+-\d+\.pktriot\.net)", 10)
+            match = wait_for_pattern(self.process, GENERAL_URL_PATTERNS, 20)
             full_url = f"http://{match.group(1)}"
             logger.info(f"Packetriot URL: {full_url}")
             return full_url
@@ -442,7 +548,7 @@ class BoreDigitalTunnel(BaseTunnel):
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1
         )
         try:
-            match = wait_for_pattern(self.process, r"(https://[^\s]+bore\.digital[^\s]*)", 10)
+            match = wait_for_pattern(self.process, GENERAL_URL_PATTERNS, 20)
             url = match.group(0).strip()
             logger.info(f"BoreDigital URL: {url}")
             return url
@@ -503,7 +609,7 @@ class DevTunnel(BaseTunnel):
                             dev_url = match.group(1)
                             logger.info(f"DevTunnel URL: {dev_url}")
                             return dev_url
-            if time.monotonic() - start > 15:
+            if time.monotonic() - start > 30:
                 raise Exception("Timeout: Failed to get devtunnel URL")
 
     def stop(self):
@@ -520,7 +626,7 @@ class Btunnel(BaseTunnel):
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1, shell=True
         )
         try:
-            match = wait_for_pattern(self.process, r"(https://[^\s]+-free\.in\.btunnel\.co\.in)", 10)
+            match = wait_for_pattern(self.process, GENERAL_URL_PATTERNS, 20)
             url = match.group(1).strip()
             logger.info(f"Btunnel URL: {url}")
             return url
@@ -559,7 +665,7 @@ class OpenportTunnel(BaseTunnel):
         )
         main_port = None
         start_time = time.monotonic()
-        timeout = 45
+        timeout = 60
         while time.monotonic() - start_time < timeout:
             for stream in (self.process.stdout, self.process.stderr):
                 if stream is None:
@@ -604,7 +710,7 @@ class NgtorTunnel(BaseTunnel):
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1
         )
         try:
-            match = wait_for_pattern(self.process, r"(http://\S+\.onion)", 30)
+            match = wait_for_pattern(self.process, GENERAL_URL_PATTERNS, 40)
             onion_url = match.group(1)
             logger.info(f"Ngtor Onion URL: {onion_url}")
             return onion_url
@@ -622,7 +728,7 @@ class EphemeralHiddenServiceTunnel(BaseTunnel):
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1
         )
         try:
-            match = wait_for_pattern(self.process, r"(http://\S+\.onion)", 30)
+            match = wait_for_pattern(self.process, GENERAL_URL_PATTERNS, 40)
             onion_url = match.group(1)
             logger.info(f"Ephemeral Hidden Service URL: {onion_url}")
             return onion_url
@@ -665,7 +771,6 @@ tunnel_tools = [
     CloudflareTunnel(),
     DevTunnel(),
     ZrokTunnel(),
-    LocalTunnel(),
     ServeoTunnel(),
     TelebitTunnel(),
     BoreTunnel(),
@@ -685,6 +790,7 @@ tunnel_tools = [
     Btunnel(),
     TunnelPyjamas(),
     EphemeralHiddenServiceTunnel(),
+    LocalTunnel(),
     # PagekiteTunnel(),  # Uncomment if implemented.
 ]
 
