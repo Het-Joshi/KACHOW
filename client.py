@@ -4,8 +4,8 @@ client.py
 
 An academically oriented client for measuring tunnel performance,
 file transfers, diagnostics, and web tests via a server that manages tunnels.
-This script integrates advanced measurement features, retains detailed measurement
-data for international research standards, and uses asynchronous patterns and progress bars.
+This script integrates advanced measurement features for international research,
+using asynchronous httpx calls, Playwright for front-end metrics, and tqdm for progress.
 
 Requirements:
   pip install requests tqdm playwright httpx psutil
@@ -19,6 +19,7 @@ import asyncio
 import json
 import os
 import hashlib
+import sys
 import time
 import datetime
 import logging
@@ -30,18 +31,17 @@ from typing import List, Dict, Any, Optional
 from tqdm import tqdm
 import httpx
 from playwright.async_api import async_playwright, Browser
-
-# Import tunnel tools (make sure tunnel_tools.py is in the same directory)
+# Import tunnel tools from tunnel_tools.py
 from tunnel_tools import tunnel_tools
 
-# ----------------- Global Constants ----------------- #
+# ---------------- Global Constants ---------------- #
 TOR_SOCKS_PORT = 9050
 TOR_SOCKS_HOST = '127.0.0.1'
-SERVER_HOST = 'localhost'
+SERVER_HOST = '209.38.108.22'
 SERVER_PORT = 3000
 SERVER_URL = f'http://{SERVER_HOST}:{SERVER_PORT}'
 ENABLE_LOGGING = True
-ENABLE_PCAP = False  # Disabled by default, stubbed for academic purposes
+ENABLE_PCAP = False  # Stubbed
 NUM_MEASUREMENTS = 1
 
 TEMP_DIR = os.path.join(os.path.abspath(os.path.expanduser("~")), "client_temp")
@@ -49,23 +49,23 @@ RESULTS_DIR = os.path.join(os.getcwd(), "results")
 os.makedirs(TEMP_DIR, exist_ok=True)
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
-# ----------------- Logging Setup ----------------- #
+# ---------------- Logging Setup ---------------- #
 logging.basicConfig(
     level=logging.INFO if ENABLE_LOGGING else logging.ERROR,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-# ----------------- Data Classes ----------------- #
+# ---------------- Data Classes ---------------- #
 @dataclass
 class Timing:
-    duration: float  # in milliseconds
+    duration: float  # in ms
 
 @dataclass
 class DiagnosticResult:
     tool: str
     rawOutput: str
-    parsedOutput: Any  # can be dict or str
+    parsedOutput: Any
     timing: Timing
     error: Optional[str] = None
 
@@ -79,14 +79,6 @@ class CurlResult:
     speed_download: float
     speed_upload: float
     error: Optional[str] = None
-
-@dataclass
-class FileMetadata:
-    filename: str
-    size: int
-    hash: str
-    contentType: str
-    timestamp: str
 
 @dataclass
 class FileTransferResult:
@@ -128,12 +120,12 @@ class RunResult:
     tool: str
     diagnostics: List[Dict]  # Stubbed diagnostics data
     measurements: List[Measurement]
-    durations: Dict[str, Any]  # Total, setup, diagnostics, and measurements durations
+    durations: Dict[str, Any]
     pcap_file_path: Optional[str] = None
     all_downloads_complete: bool = True
     errors: List[Dict[str, str]] = None
 
-# ----------------- Utility Classes and Functions ----------------- #
+# ---------------- Utility Classes and Functions ---------------- #
 class Stopwatch:
     def __init__(self):
         self.start_time = 0.0
@@ -163,7 +155,7 @@ async def run_command(command: str, args: List[str]) -> Dict[str, Any]:
     }
 
 class Curl:
-    """Parser for curl command output to extract transfer metrics."""
+    """Parser for curl output to extract transfer metrics."""
     def parse(self, output: str) -> CurlResult:
         result = CurlResult(
             status_code=0,
@@ -188,7 +180,7 @@ class Curl:
                 if key == 'http_code':
                     result.status_code = int(value)
                 elif key in result.time_split:
-                    result.time_split[key] = float(value) * 1000  # convert seconds to ms
+                    result.time_split[key] = float(value) * 1000
                 elif key == 'download_speed':
                     result.speed_download = float(value)
                 elif key == 'upload_speed':
@@ -376,18 +368,19 @@ async def perform_measurements_run(tunnel_tool_name: str, enable_pcap: bool, num
         try:
             response = await client.get(f'{SERVER_URL}/files')
             available_files = response.json()
-            logger.info(f"Fetched metadata for {len(available_files)} files")
+            logger.info(f"ðŸ“ Fetched metadata for {len(available_files)} files")
         except Exception as e:
             errors.append({'stage': 'File Metadata Fetch', 'error': str(e)})
             available_files = []
 
     # Start tunnel via server
     try:
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=30) as client:
             response = await client.post(f'{SERVER_URL}/start-tunnel', json={'toolName': tunnel_tool_name})
-            tunnel_url = response.json().get('url', '')
-            tunnel_url = tunnel_url.rstrip('/') if tunnel_url.endswith('/') else tunnel_url
-            logger.info(f"Tunnel started: {tunnel_url}")
+            if response.status_code != 200:
+                raise Exception(response.json().get('detail', 'Unknown error'))
+            tunnel_url = response.json().get('url', '').rstrip('/')
+            logger.info(f"âœ… Tunnel started: {tunnel_url}")
     except Exception as e:
         errors.append({'stage': 'Tunnel Setup', 'error': str(e)})
         tunnel_url = ""
@@ -401,7 +394,7 @@ async def perform_measurements_run(tunnel_tool_name: str, enable_pcap: bool, num
         logger.info(f"PCAP capture started (stub), saving to {pcap_file_path}")
 
     setup_stopwatch.stop()
-    logger.info("Waiting 10 seconds for tunnel stabilization...")
+    logger.info("â³ Waiting 10 seconds for tunnel stabilization...")
     await asyncio.sleep(10)
 
     # Diagnostics Stage (skip for .onion)
@@ -468,9 +461,9 @@ async def perform_measurements_run(tunnel_tool_name: str, enable_pcap: bool, num
 
     # Cleanup: Stop tunnel via server
     try:
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=10) as client:
             await client.post(f'{SERVER_URL}/stop-tunnel')
-            logger.info("Tunnel stopped successfully via server")
+            logger.info("âœ… Tunnel stopped successfully via server")
     except Exception as e:
         errors.append({'stage': 'Tunnel Cleanup', 'error': str(e)})
 
@@ -586,3 +579,4 @@ if __name__ == '__main__':
     except KeyboardInterrupt:
         logger.info("KeyboardInterrupt received. Exiting gracefully.")
         sys.exit(0)
+
